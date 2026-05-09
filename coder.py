@@ -9,6 +9,7 @@ import shutil
 import sys
 import re
 import hashlib
+import argparse
 from collections import Counter
 
 class YouTubeEncoder:
@@ -65,6 +66,39 @@ class YouTubeEncoder:
         print(f"📊 Сетка: {self.blocks_x} x {self.blocks_y} блоков на регион")
         print(f"🎞️  FPS: {self.fps}")
         print(f"🔐 Шифрование: {'ВКЛ' if self.use_encryption else 'ВЫКЛ'}")
+    
+    def _find_ffmpeg(self):
+        """Ищет FFmpeg: сначала в системе, затем в imageio-ffmpeg"""
+        # Проверяем системный FFmpeg
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            return 'ffmpeg'
+        except Exception:
+            pass
+        
+        # Проверяем imageio-ffmpeg
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            if os.path.isfile(ffmpeg_exe):
+                print(f"📦 FFmpeg найден через imageio-ffmpeg: {ffmpeg_exe}")
+                return ffmpeg_exe
+        except Exception:
+            pass
+        
+        return None
+    
+    def _write_opencv_video(self, temp_dir, frames_needed, output_file):
+        """Записывает видео через OpenCV (запасной вариант)"""
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_file, fourcc, self.fps, (self.width, self.height))
+        
+        for frame_num in range(frames_needed):
+            frame_file = os.path.join(temp_dir, f"frame_{frame_num:05d}.png")
+            frame = cv2.imread(frame_file)
+            if frame is not None:
+                out.write(frame)
+        out.release()
     
     def _encrypt_data(self, data):
         """XOR шифрование с ключом"""
@@ -227,11 +261,12 @@ class YouTubeEncoder:
         # Конвертируем в MP4
         print("\n🎞️  Конвертация в MP4...")
         
-        try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-            
+        # Определяем путь к FFmpeg
+        ffmpeg_path = self._find_ffmpeg()
+        
+        if ffmpeg_path:
             cmd = [
-                'ffmpeg',
+                ffmpeg_path,
                 '-framerate', str(self.fps),
                 '-i', os.path.join(temp_dir, 'frame_%05d.png'),
                 '-c:v', 'libx264',
@@ -244,20 +279,15 @@ class YouTubeEncoder:
                 output_file
             ]
             
-            subprocess.run(cmd, check=True, capture_output=True)
-            print("✅ FFmpeg конвертация успешна")
-            
-        except Exception as e:
-            print(f"⚠️ FFmpeg не доступен, использую OpenCV...")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_file, fourcc, self.fps, (self.width, self.height))
-            
-            for frame_num in range(frames_needed):
-                frame_file = os.path.join(temp_dir, f"frame_{frame_num:05d}.png")
-                frame = cv2.imread(frame_file)
-                if frame is not None:
-                    out.write(frame)
-            out.release()
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+                print("✅ FFmpeg конвертация успешна")
+            except Exception as e:
+                print(f"⚠️ Ошибка FFmpeg: {e}, использую OpenCV...")
+                self._write_opencv_video(temp_dir, frames_needed, output_file)
+        else:
+            print("⚠️ FFmpeg не найден, использую OpenCV...")
+            self._write_opencv_video(temp_dir, frames_needed, output_file)
         
         # Удаляем временные файлы
         shutil.rmtree(temp_dir)
@@ -572,39 +602,135 @@ def read_key_from_file(key_file='key.txt'):
     return None
 
 
+def save_key_to_file(key, key_file='key.txt'):
+    """Сохраняет ключ в файл key.txt"""
+    try:
+        with open(key_file, 'w', encoding='utf-8') as f:
+            f.write(key)
+        print(f"🔑 Ключ сохранён в {key_file}")
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения ключа: {e}")
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("\n" + "="*60)
-        print("🎥 YouTube File Storage (6 FPS)")
-        print("="*60)
-        print("\nИспользование:")
-        print("  encode <файл> [output.mp4]  - закодировать файл")
-        print("  decode <видео> [папка]      - декодировать видео")
-        print("\nХарактеристики:")
-        print("  • Частота кадров: 6 FPS")
-        print("  • Масштабирование к 1920x1080")
-        print("  • Маркер конца данных")
-        print("  • 5 защитных кадров")
-        print("\nШифрование:")
-        print("  • Для шифрования создайте key.txt с ключом")
-        return
-    
-    # Читаем ключ из файла
-    key = read_key_from_file()
-    
-    if sys.argv[1] == "encode":
-        encoder = YouTubeEncoder(key)
-        input_file = sys.argv[2]
-        output = sys.argv[3] if len(sys.argv) > 3 else "output.mp4"
-        encoder.encode(input_file, output)
+    # Поддержка запуска с аргументами командной строки (старый режим)
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(
+            description='🎥 YouTube File Storage (6 FPS) — кодирование/декодирование файлов в видео',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog='''Примеры:
+  python coder.py encode data.zip -o video.mp4 -k mypass123
+  python coder.py decode video.mp4 -o ./restored -k mypass123
+  python coder.py encode data.zip -o video.mp4
+  python coder.py decode video.mp4
+
+Если ключ (-k) не указан, программа попытается прочитать его из key.txt.
+Если ключ (-k) указан, он будет сохранён в key.txt для дальнейшего использования.'''
+        )
         
-    elif sys.argv[1] == "decode":
-        decoder = YouTubeDecoder(key)
-        video_file = sys.argv[2]
-        output_dir = sys.argv[3] if len(sys.argv) > 3 else "."
-        decoder.decode(video_file, output_dir)
+        subparsers = parser.add_subparsers(dest='command', help='Команда')
+        
+        # encode
+        enc = subparsers.add_parser('encode', help='Закодировать файл в видео')
+        enc.add_argument('input', help='Путь до входного файла')
+        enc.add_argument('-o', '--output', default='output.mp4', help='Название выходного видео (по умолчанию: output.mp4)')
+        enc.add_argument('-k', '--key', default=None, help='Ключ шифрования (сохраняется в key.txt)')
+        
+        # decode
+        dec = subparsers.add_parser('decode', help='Декодировать видео в файл')
+        dec.add_argument('input', help='Путь до видеофайла')
+        dec.add_argument('-o', '--output', default='.', help='Папка для сохранения результата (по умолчанию: текущая папка)')
+        dec.add_argument('-k', '--key', default=None, help='Ключ шифрования (сохраняется в key.txt)')
+        
+        args = parser.parse_args()
+        
+        if not args.command:
+            parser.print_help()
+            return
+        
+        # Определяем ключ: из аргумента или из файла
+        if args.key:
+            key = args.key
+            save_key_to_file(key)
+        else:
+            key = read_key_from_file()
+        
+        if args.command == 'encode':
+            encoder = YouTubeEncoder(key)
+            encoder.encode(args.input, args.output)
+            
+        elif args.command == 'decode':
+            decoder = YouTubeDecoder(key)
+            decoder.decode(args.input, args.output)
+        return
+
+    # Интерактивный режим (запуск без аргументов)
+    print()
+    print("=" * 60)
+    print("  YouTube File Storage — кодирование/декодирование")
+    print("=" * 60)
+    print()
+    print("Выберите режим:")
+    print("  1 — Кодировать файл в видео (encode)")
+    print("  2 — Декодировать видео в файл (decode)")
+    print()
+
+    while True:
+        choice = input("Введите номер режима (1 или 2): ").strip()
+        if choice in ('1', '2'):
+            break
+        print("⚠️  Введите 1 или 2")
+
+    # Ввод пути до файла
+    while True:
+        input_file = input("Путь до входного файла: ").strip()
+        if input_file and os.path.exists(input_file):
+            break
+        if input_file:
+            print(f"❌ Файл не найден: {input_file}")
+        else:
+            print("⚠️  Путь не может быть пустым")
+
+    # Ввод названия выходного файла
+    if choice == '1':
+        default_output = 'output.mp4'
+        prompt_text = "Название выходного видео"
     else:
-        print(f"❌ Неизвестная команда: {sys.argv[1]}")
+        default_output = '.'
+        prompt_text = "Папка для сохранения результата"
+
+    output_val = input(f"{prompt_text} [по умолчанию: {default_output}]: ").strip()
+    if not output_val:
+        output_val = default_output
+
+    # Ввод ключа шифрования
+    saved_key = read_key_from_file()
+    if saved_key:
+        print(f"🔑 Найден сохранённый ключ: {saved_key}")
+        use_saved = input("Использовать этот ключ? (д/н) [по умолчанию: д]: ").strip().lower()
+        if use_saved in ('', 'д', 'да', 'y', 'yes'):
+            key = saved_key
+        else:
+            key = None
+    else:
+        key = None
+
+    if key is None:
+        key_input = input("Ключ шифрования (Enter — без шифрования): ").strip()
+        if key_input:
+            key = key_input
+            save_key_to_file(key)
+        else:
+            key = None
+            print("ℹ️  Шифрование отключено")
+
+    # Запуск
+    if choice == '1':
+        encoder = YouTubeEncoder(key)
+        encoder.encode(input_file, output_val)
+    else:
+        decoder = YouTubeDecoder(key)
+        decoder.decode(input_file, output_val)
 
 
 if __name__ == "__main__":
