@@ -10,6 +10,8 @@ import sys
 import re
 import hashlib
 import argparse
+import zipfile
+import io
 from collections import Counter
 
 class YouTubeEncoder:
@@ -162,27 +164,39 @@ class YouTubeEncoder:
         return blocks
     
     def encode(self, input_file, output_file):
-        """Кодирует файл в видео с опциональным шифрованием"""
+        """Кодирует файл в видео с опциональным шифрованием (с предварительным ZIP-сжатием)"""
         
         print("\n📤 КОДИРОВАНИЕ ФАЙЛА")
         print("-" * 40)
         
-        # Читаем файл
-        with open(input_file, 'rb') as f:
-            data = f.read()
-        
+        # Сжатие в ZIP
+        original_name = os.path.basename(input_file)
+        original_size = os.path.getsize(input_file)
         print(f"📄 Файл: {input_file}")
-        print(f"📦 Размер: {len(data)} байт")
+        print(f"📦 Размер: {original_size} байт")
         
-        # Шифруем данные если нужно
+        print(f"🗜️  Сжатие в ZIP...")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.write(input_file, original_name)
+        zip_data = buf.getvalue()
+        
+        zip_name = original_name + '.zip'
+        zip_size = len(zip_data)
+        ratio = (1 - zip_size / original_size) * 100 if original_size > 0 else 0
+        print(f"📦 ZIP: {zip_size} байт | Сжатие: {ratio:.1f}%")
+        
+        # Шифруем ZIP-данные если нужно
         if self.use_encryption:
-            encrypted_data = self._encrypt_data(data)
+            encrypted_data = self._encrypt_data(zip_data)
             print(f"🔐 Данные зашифрованы")
         else:
-            encrypted_data = data
+            encrypted_data = zip_data
         
-        # Создаем заголовок
-        header = f"FILE:{os.path.basename(input_file)}:SIZE:{len(data)}|"
+        del zip_data
+        
+        # Создаем заголовок (с информацией об оригинале)
+        header = f"FILE:{zip_name}:SIZE:{len(encrypted_data)}:ORIG:{original_name}:ORIGSIZE:{original_size}|"
         header_bytes = header.encode('latin-1')
         print(f"📋 Заголовок: {header}")
         
@@ -524,37 +538,65 @@ class YouTubeDecoder:
         else:
             print("⚠️ Маркер конца не найден")
         
-        # Поиск заголовка
-        data_str = bytes_data[:1000].decode('latin-1', errors='ignore')
-        pattern = r'FILE:([^:]+):SIZE:(\d+)\|'
-        match = re.search(pattern, data_str)
+        # Поиск заголовка — сначала новый формат (ZIP-сжатие)
+        # Из-за цветовых искажений при сжатии видео буквы могут искажаться
+        # (например O -> N), поэтому ищем гибким паттерном
+        data_str = bytes_data[:2000].decode('latin-1', errors='ignore')
+        pattern_new = r'FILE:([^:]+)\.z[i1]p:SIZE:(\d+):.{0,5}RIG:([^:]+):.{0,8}RIG[S5]IZE:(\d+)\|'
+        pattern_old = r'FILE:([^:]+):SIZE:(\d+)\|'
+        match_new = re.search(pattern_new, data_str)
         
-        if match:
-            filename = match.group(1)
-            filesize = int(match.group(2))
+        if match_new:
+            zip_base = match_new.group(1)
+            zip_size = int(match_new.group(2))
+            original_name = match_new.group(3)
+            original_size = int(match_new.group(4))
+            zip_name = zip_base + '.zip'
             
-            print(f"\n✅ Найден заголовок: {filename}, размер: {filesize} байт")
+            print(f"\n✅ Найден заголовок (ZIP): {zip_name}, размер: {zip_size} байт")
+            print(f"📄 Оригинал: {original_name}, размер: {original_size} байт")
             
-            header_str = match.group(0)
+            header_str = match_new.group(0)
             header_bytes = header_str.encode('latin-1')
             header_pos = bytes_data.find(header_bytes)
             
             if header_pos >= 0:
                 # Извлекаем зашифрованные данные
-                encrypted_data = bytes_data[header_pos + len(header_bytes):header_pos + len(header_bytes) + filesize]
+                encrypted_data = bytes_data[header_pos + len(header_bytes):header_pos + len(header_bytes) + zip_size]
                 
                 # Дешифруем если есть ключ
                 if self.key:
-                    file_data = self._decrypt_data(encrypted_data)
+                    zip_data = self._decrypt_data(encrypted_data)
                     print(f"🔓 Данные расшифрованы")
                 else:
-                    file_data = encrypted_data
+                    zip_data = encrypted_data
                     print(f"⚠️ Данные без расшифровки")
                 
-                # Сохраняем файл
-                output_path = os.path.join(output_dir, filename)
+                # Распаковка ZIP
+                print(f"🗜️  Распаковка ZIP...")
+                try:
+                    buf = io.BytesIO(zip_data)
+                    with zipfile.ZipFile(buf, 'r') as zf:
+                        names = zf.namelist()
+                        if not names:
+                            print("❌ ZIP-архив пуст")
+                            return False
+                        extract_name = original_name if original_name in names else names[0]
+                        file_data = zf.read(extract_name)
+                    print(f"📦 ZIP распакован: {extract_name} ({len(file_data)} байт)")
+                except zipfile.BadZipFile:
+                    print("❌ Повреждённый ZIP-архив")
+                    return False
+                except Exception as e:
+                    print(f"❌ Ошибка распаковки ZIP: {e}")
+                    return False
+                
+                del zip_data
+                
+                # Сохраняем оригинальный файл
+                output_path = os.path.join(output_dir, original_name)
                 counter = 1
-                base, ext = os.path.splitext(filename)
+                base, ext = os.path.splitext(original_name)
                 while os.path.exists(output_path):
                     output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
                     counter += 1
@@ -566,14 +608,61 @@ class YouTubeDecoder:
                 print(f"📏 Размер: {len(file_data)} байт")
                 
                 # Проверка размера
-                if len(file_data) == filesize:
+                if len(file_data) == original_size:
                     print("✅ Размер совпадает с оригиналом")
                 else:
-                    print(f"⚠️ Размер не совпадает: {len(file_data)} != {filesize}")
+                    print(f"⚠️ Размер не совпадает: {len(file_data)} != {original_size}")
                 
                 return True
         else:
-            print("❌ Заголовок не найден")
+            # Пробуем старый формат (без сжатия)
+            match_old = re.search(pattern_old, data_str)
+            
+            if match_old:
+                filename = match_old.group(1)
+                filesize = int(match_old.group(2))
+                
+                print(f"\n✅ Найден заголовок (без сжатия): {filename}, размер: {filesize} байт")
+                
+                header_str = match_old.group(0)
+                header_bytes = header_str.encode('latin-1')
+                header_pos = bytes_data.find(header_bytes)
+                
+                if header_pos >= 0:
+                    # Извлекаем зашифрованные данные
+                    encrypted_data = bytes_data[header_pos + len(header_bytes):header_pos + len(header_bytes) + filesize]
+                    
+                    # Дешифруем если есть ключ
+                    if self.key:
+                        file_data = self._decrypt_data(encrypted_data)
+                        print(f"🔓 Данные расшифрованы")
+                    else:
+                        file_data = encrypted_data
+                        print(f"⚠️ Данные без расшифровки")
+                    
+                    # Сохраняем файл
+                    output_path = os.path.join(output_dir, filename)
+                    counter = 1
+                    base, ext = os.path.splitext(filename)
+                    while os.path.exists(output_path):
+                        output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
+                        counter += 1
+                    
+                    with open(output_path, 'wb') as f:
+                        f.write(file_data)
+                    
+                    print(f"\n✅ Файл восстановлен: {output_path}")
+                    print(f"📏 Размер: {len(file_data)} байт")
+                    
+                    # Проверка размера
+                    if len(file_data) == filesize:
+                        print("✅ Размер совпадает с оригиналом")
+                    else:
+                        print(f"⚠️ Размер не совпадает: {len(file_data)} != {filesize}")
+                    
+                    return True
+            else:
+                print("❌ Заголовок не найден")
         
         # Если не нашли заголовок
         output_path = os.path.join(output_dir, "decoded_data.bin")

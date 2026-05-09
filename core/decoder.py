@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 import os
 import re
+import zipfile
+import io
 
 from core.crypto import xor_decrypt
 
@@ -28,14 +30,23 @@ COLORS = {
 }
 
 EOF_BYTES = b'\xe2\x96\x88' * 64
-HEADER_PATTERN = re.compile(r'FILE:([^:]+):SIZE:(\d+)\|')
+
+# Заголовок: FILE:name:SIZE:num|  (старый формат)
+# или       FILE:name.zip:SIZE:num:ORIG:origname:ORIGSIZE:origsize|  (новый, ZIP)
+# Из-за цветовых искажений при сжатии видео буквы могут искажаться
+# (например O -> N), поэтому ищем гибким паттерном
+HEADER_PATTERN = re.compile(
+    r'FILE:([^:]+)\.z[i1]p:SIZE:(\d+):.{0,5}RIG:([^:]+):.{0,8}RIG[S5]IZE:(\d+)\|'
+)
+# Старый формат (без ZIP)
+HEADER_PATTERN_OLD = re.compile(r'FILE:([^:]+):SIZE:(\d+)\|')
 
 # Предвычисленные таблицы для быстрого декодирования
 _COLOR_VALUES = np.array(list(COLORS.values()), dtype=np.int32)
 _COLOR_KEYS = list(COLORS.keys())
 # Таблица: индекс ближайшего цвета -> 4-битная строка
 # Для быстрого поиска используем квантование: округляем RGB до 64 уровней
-_QUANT_SHIFT = 6  # делим на 64, получаем 4 уровня на канал
+_QUANT_SHIFT = 5  # делим на 32, получаем 8 уровней на канал (16 уникальных бакетов)
 
 
 class YouTubeDecoder:
@@ -170,6 +181,7 @@ class YouTubeDecoder:
     ) -> bool:
         """
         Декодирует видео в файл.
+        Поддерживает новый формат (ZIP-сжатие) и старый (без сжатия).
 
         on_log(str)       — вызывается для каждого текстового сообщения
         on_progress(pct)  — вызывается с процентом прогресса (0..100)
@@ -234,16 +246,90 @@ class YouTubeDecoder:
         else:
             log("Маркер конца не найден")
 
-        # Заголовок
-        data_str = bytes_data[:1000].decode('latin-1', errors='ignore')
-        match = HEADER_PATTERN.search(data_str)
+        # Заголовок — сначала пробуем новый формат (ZIP-сжатие)
+        data_str = bytes_data[:2000].decode('latin-1', errors='ignore')
+        match_new = HEADER_PATTERN.search(data_str)
 
-        if match:
-            filename = match.group(1)
-            filesize = int(match.group(2))
-            log(f"Заголовок: {filename}, размер: {filesize} байт")
+        if match_new:
+            # Новый формат: ZIP-сжатые данные
+            zip_base = match_new.group(1)
+            zip_size = int(match_new.group(2))
+            original_name = match_new.group(3)
+            original_size = int(match_new.group(4))
+            zip_name = zip_base + '.zip'
+            log(f"Заголовок (ZIP): {zip_name}, размер: {zip_size} байт")
+            log(f"Оригинал: {original_name}, размер: {original_size} байт")
 
-            header_bytes = match.group(0).encode('latin-1')
+            header_bytes = match_new.group(0).encode('latin-1')
+            header_pos = bytes_data.find(header_bytes)
+
+            if header_pos >= 0:
+                encrypted_data = bytes_data[header_pos + len(header_bytes):
+                                            header_pos + len(header_bytes) + zip_size]
+
+                if self.key:
+                    zip_data = xor_decrypt(encrypted_data, self.key)
+                    log("Данные расшифрованы")
+                else:
+                    zip_data = encrypted_data
+                    log("Данные без расшифровки (ключ не указан)")
+
+                # Распаковка ZIP
+                log("Распаковка ZIP...")
+                try:
+                    buf = io.BytesIO(zip_data)
+                    with zipfile.ZipFile(buf, 'r') as zf:
+                        # Извлекаем первый файл из архива
+                        names = zf.namelist()
+                        if not names:
+                            log("Ошибка: ZIP-архив пуст")
+                            return False
+
+                        # Ищем файл с оригинальным именем
+                        extract_name = original_name if original_name in names else names[0]
+                        file_data = zf.read(extract_name)
+
+                    log(f"ZIP распакован: {extract_name} ({len(file_data)} байт)")
+                except zipfile.BadZipFile:
+                    log("Ошибка: повреждённый ZIP-архив")
+                    return False
+                except Exception as e:
+                    log(f"Ошибка распаковки ZIP: {e}")
+                    return False
+
+                del zip_data
+
+                # Сохраняем оригинальный файл
+                output_path = os.path.join(output_dir, original_name)
+                base, ext = os.path.splitext(original_name)
+                counter = 1
+                while os.path.exists(output_path):
+                    output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
+                    counter += 1
+
+                with open(output_path, 'wb') as f:
+                    f.write(file_data)
+
+                log(f"Файл восстановлен: {output_path}")
+                log(f"Размер: {len(file_data)} байт")
+                if len(file_data) == original_size:
+                    log("Размер совпадает с оригиналом")
+                else:
+                    log(f"Размер не совпадает: {len(file_data)} != {original_size}")
+
+                if on_progress:
+                    on_progress(100)
+                return True
+
+        # Пробуем старый формат (без сжатия)
+        match_old = HEADER_PATTERN_OLD.search(data_str)
+
+        if match_old:
+            filename = match_old.group(1)
+            filesize = int(match_old.group(2))
+            log(f"Заголовок (без сжатия): {filename}, размер: {filesize} байт")
+
+            header_bytes = match_old.group(0).encode('latin-1')
             header_pos = bytes_data.find(header_bytes)
 
             if header_pos >= 0:
