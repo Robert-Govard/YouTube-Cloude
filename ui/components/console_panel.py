@@ -1,8 +1,8 @@
 """Встроенная консоль — перехватывает stdout/stderr и показывает в GUI."""
 
 import sys
-import io
 import threading
+import time
 import customtkinter as ctk
 from ..theme import COLORS, FONT_LOG
 
@@ -25,8 +25,7 @@ class ConsolePanel(ctk.CTkFrame):
     Панель консоли внутри приложения.
 
     Перехватывает stdout и stderr, отображая весь вывод в текстовом поле.
-    Оригинальные потоки сохраняются, поэтому print() работает как обычно
-    и одновременно появляется в GUI.
+    Использует батч-обновление: накопленные строки сбрасываются раз в 150мс.
     """
 
     def __init__(self, master, **kwargs):
@@ -73,44 +72,48 @@ class ConsolePanel(ctk.CTkFrame):
         self._textbox.configure(state='disabled')
 
         # ── Перехват stdout/stderr ──────────────────────────
-        # При PyInstaller --windowed потоки могут быть None
         self._original_stdout = sys.stdout if sys.stdout else _NullStream()
         self._original_stderr = sys.stderr if sys.stderr else _NullStream()
         self._lock = threading.Lock()
+        self._pending: list[str] = []
+        self._flush_scheduled = False
 
         sys.stdout = _StreamInterceptor(self, 'out')
         sys.stderr = _StreamInterceptor(self, 'err')
 
     def write(self, text: str, source: str = 'out'):
-        """Записывает текст в консоль GUI + оригинальный поток."""
-        with self._lock:
-            # Оригинальный поток (реальный терминал), безопасно если None
-            try:
-                if source == 'err':
-                    self._original_stderr.write(text)
-                    self._original_stderr.flush()
-                else:
-                    self._original_stdout.write(text)
-                    self._original_stdout.flush()
-            except (AttributeError, ValueError):
-                pass
-
-            # GUI — только если есть непустой текст
-            if text and text.strip():
-                self._append(text)
-
-    def _append(self, text: str):
-        """Потокобезопасная вставка текста в виджет."""
+        """Записывает текст в буфер + оригинальный поток."""
+        # Оригинальный поток
         try:
-            self._textbox.configure(state='normal')
-            self._textbox.insert('end', text)
-            self._textbox.see('end')
-            self._textbox.configure(state='disabled')
-        except Exception:
-            self.after(0, lambda: self._insert_safe(text))
+            if source == 'err':
+                self._original_stderr.write(text)
+                self._original_stderr.flush()
+            else:
+                self._original_stdout.write(text)
+                self._original_stdout.flush()
+        except (AttributeError, ValueError):
+            pass
 
-    def _insert_safe(self, text: str):
-        """Вставка через главный поток (thread-safe)."""
+        # GUI — только непустой текст
+        if text and text.strip():
+            with self._lock:
+                self._pending.append(text)
+            if not self._flush_scheduled:
+                self._flush_scheduled = True
+                try:
+                    self.after(150, self._flush)
+                except Exception:
+                    pass
+
+    def _flush(self):
+        """Сбрасывает буфер в текстовое поле."""
+        self._flush_scheduled = False
+        with self._lock:
+            if not self._pending:
+                return
+            text = ''.join(self._pending)
+            self._pending.clear()
+
         try:
             self._textbox.configure(state='normal')
             self._textbox.insert('end', text)
@@ -121,6 +124,8 @@ class ConsolePanel(ctk.CTkFrame):
 
     def clear(self):
         """Очищает консоль."""
+        with self._lock:
+            self._pending.clear()
         self._textbox.configure(state='normal')
         self._textbox.delete('0.0', 'end')
         self._textbox.configure(state='disabled')
@@ -142,7 +147,7 @@ class _StreamInterceptor:
 
     def __init__(self, panel: ConsolePanel, source: str):
         self._panel = panel
-        self._source = source  # 'out' или 'err'
+        self._source = source
 
     def write(self, text: str):
         self._panel.write(text, self._source)
@@ -155,7 +160,6 @@ class _StreamInterceptor:
             pass
 
     def __getattr__(self, name):
-        # Проксируем остальные атрибуты к оригинальному потоку
         original = self._panel._original_stdout if self._source == 'out' else self._panel._original_stderr
         try:
             return getattr(original, name)

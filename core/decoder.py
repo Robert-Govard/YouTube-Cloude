@@ -30,6 +30,13 @@ COLORS = {
 EOF_BYTES = b'\xe2\x96\x88' * 64
 HEADER_PATTERN = re.compile(r'FILE:([^:]+):SIZE:(\d+)\|')
 
+# Предвычисленные таблицы для быстрого декодирования
+_COLOR_VALUES = np.array(list(COLORS.values()), dtype=np.int32)
+_COLOR_KEYS = list(COLORS.keys())
+# Таблица: индекс ближайшего цвета -> 4-битная строка
+# Для быстрого поиска используем квантование: округляем RGB до 64 уровней
+_QUANT_SHIFT = 6  # делим на 64, получаем 4 уровня на канал
+
 
 class YouTubeDecoder:
     def __init__(self, key: str | None = None):
@@ -43,11 +50,7 @@ class YouTubeDecoder:
         self.key = key
 
         self.colors = COLORS
-        self.color_values = np.array(list(self.colors.values()), dtype=np.int32)
-        self.color_keys = list(self.colors.keys())
         self.color_cache: dict[tuple, str] = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
 
         # Расчёт сетки
         self.blocks_x = (self.width - 2 * self.marker_size) // (self.block_width + self.spacing)
@@ -56,76 +59,105 @@ class YouTubeDecoder:
 
         self._precompute_coordinates()
 
-    # ── внутренние утилиты ──────────────────────────────────
+        # Предвычисление таблицы квантованных цветов
+        self._quant_lut = self._build_quant_lut()
+
+    # ── предвычисления ─────────────────────────────────────
 
     def _precompute_coordinates(self):
-        """Предвычисляет координаты центров блоков."""
+        """Предвычисляет координаты центров блоков в виде numpy-массивов."""
         ms = self.marker_size
-        self.block_coords: list[tuple[int, int]] = []
+        bx, by = self.blocks_x, self.blocks_y
+        stride_x = self.block_width + self.spacing
+        stride_y = self.block_height + self.spacing
+
+        cx_list = []
+        cy_list = []
         for idx in range(self.blocks_per_region):
-            y = idx // self.blocks_x
-            x = idx % self.blocks_x
-            if y < self.blocks_y:
-                cx = ms + x * (self.block_width + self.spacing) + self.block_width // 2
-                cy = ms + y * (self.block_height + self.spacing) + self.block_height // 2
-                self.block_coords.append((cx, cy))
+            row = idx // bx
+            col = idx % bx
+            if row < by:
+                cx = ms + col * stride_x + self.block_width // 2
+                cy = ms + row * stride_y + self.block_height // 2
+                cx_list.append(cx)
+                cy_list.append(cy)
 
-    def _color_to_bits(self, color: tuple) -> str:
-        """Оптимизированный поиск ближайшего цвета."""
-        color_key = (color[0], color[1], color[2])
-        if color_key in self.color_cache:
-            self.cache_hits += 1
-            return self.color_cache[color_key]
+        self._cx_arr = np.array(cx_list, dtype=np.int32)
+        self._cy_arr = np.array(cy_list, dtype=np.int32)
+        self._n_blocks = len(cx_list)
 
-        self.cache_misses += 1
+    def _build_quant_lut(self) -> dict:
+        """Строит lookup-таблицу: квантованный цвет -> 4-битная строка."""
+        lut: dict[tuple, str] = {}
+        for bits, color in self.colors.items():
+            q = (color[0] >> _QUANT_SHIFT, color[1] >> _QUANT_SHIFT, color[2] >> _QUANT_SHIFT)
+            if q not in lut:
+                lut[q] = bits
+        return lut
 
-        # Быстрая проверка на синий фон
-        if color[0] > 200 and color[1] < 50 and color[2] < 50:
-            self.color_cache[color_key] = '0000'
-            return '0000'
+    # ── быстрое декодирование ─────────────────────────────
 
-        color_arr = np.array([color[0], color[1], color[2]], dtype=np.int32)
-        distances = np.sum((self.color_values - color_arr) ** 2, axis=1)
-        best_idx = int(np.argmin(distances))
-        result = self.color_keys[best_idx]
-        self.color_cache[color_key] = result
-        return result
-
-    def _decode_frame(self, frame: np.ndarray) -> list[str]:
-        """Декодирует один кадр в список 4-битных строк."""
+    def _decode_frame_vectorized(self, frame: np.ndarray) -> list[str]:
+        """Векторизованное декодирование одного кадра."""
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height),
                                interpolation=cv2.INTER_NEAREST)
-        h, w = frame.shape[:2]
+
+        # Читаем все пиксели центров блоков одним векторным доступом
+        pixels = frame[self._cy_arr, self._cx_arr]  # shape: (n_blocks, 3)
+
         blocks: list[str] = []
-        for cx, cy in self.block_coords:
-            if cx < w and cy < h:
-                blocks.append(self._color_to_bits(frame[cy, cx]))
-            else:
-                blocks.append('0000')
+        cache = self.color_cache
+        quant_lut = self._quant_lut
+        color_values = _COLOR_VALUES
+        color_keys = _COLOR_KEYS
+
+        for i in range(self._n_blocks):
+            r, g, b = int(pixels[i, 0]), int(pixels[i, 1]), int(pixels[i, 2])
+            color_key = (r, g, b)
+
+            # Кэш
+            if color_key in cache:
+                blocks.append(cache[color_key])
+                continue
+
+            # Быстрый поиск через квантование
+            q = (r >> _QUANT_SHIFT, g >> _QUANT_SHIFT, b >> _QUANT_SHIFT)
+            if q in quant_lut:
+                result = quant_lut[q]
+                cache[color_key] = result
+                blocks.append(result)
+                continue
+
+            # Fallback: точный поиск ближайшего
+            color_arr = np.array([r, g, b], dtype=np.int32)
+            distances = np.sum((color_values - color_arr) ** 2, axis=1)
+            best_idx = int(np.argmin(distances))
+            result = color_keys[best_idx]
+            cache[color_key] = result
+            blocks.append(result)
+
         return blocks
 
     @staticmethod
     def _blocks_to_bytes(blocks: list[str]) -> bytearray:
-        """4-битные блоки -> байты."""
-        all_bits = ''.join(blocks)
-        result = bytearray()
-        for i in range(0, len(all_bits) - 7, 8):
-            byte_str = all_bits[i:i + 8]
-            if len(byte_str) == 8:
-                try:
-                    result.append(int(byte_str, 2))
-                except ValueError:
-                    result.append(0)
-        return result
+        """4-битные блоки -> байты. Оптимизировано через numpy."""
+        # Конвертируем 4-битные строки в индексы 0..15
+        nibble_arr = np.array([int(b, 2) for b in blocks], dtype=np.uint8)
+        # Чередуем пары nibble'ов в байты
+        n = len(nibble_arr)
+        if n % 2 != 0:
+            nibble_arr = np.append(nibble_arr, np.uint8(0))
+
+        high = nibble_arr[0::2].astype(np.uint8) << 4
+        low = nibble_arr[1::2]
+        result = (high | low).astype(np.uint8)
+        return bytearray(result.tobytes())
 
     @staticmethod
     def _find_eof(data: bytearray) -> int:
-        """Поиск маркера конца в данных. Возвращает позицию или -1."""
-        for i in range(len(data) - len(EOF_BYTES)):
-            if data[i:i + len(EOF_BYTES)] == EOF_BYTES:
-                return i
-        return -1
+        """Поиск маркера конца. Использует bytes.find() — C-оптимизированный."""
+        return data.find(EOF_BYTES)
 
     # ── основная логика ─────────────────────────────────────
 
@@ -164,11 +196,10 @@ class YouTubeDecoder:
 
         # Сброс кэша
         self.color_cache.clear()
-        self.cache_hits = 0
-        self.cache_misses = 0
 
         all_blocks: list[str] = []
         frames_processed = 0
+        last_progress_pct = -1
 
         for frame_num in range(total_frames):
             ret, frame = cap.read()
@@ -176,12 +207,15 @@ class YouTubeDecoder:
                 break
             frames_processed += 1
 
-            all_blocks.extend(self._decode_frame(frame))
+            all_blocks.extend(self._decode_frame_vectorized(frame))
 
+            # Обновляем прогресс не чаще чем раз в 1%
             pct = int((frame_num + 1) / total_frames * 80)
-            if on_progress:
-                on_progress(pct)
-            if frame_num % 100 == 0:
+            if pct != last_progress_pct:
+                last_progress_pct = pct
+                if on_progress:
+                    on_progress(pct)
+            if frame_num % 200 == 0:
                 log(f"Прогресс: {frame_num + 1}/{total_frames}")
 
         cap.release()
