@@ -94,11 +94,30 @@ python main.py decode video.mp4
 
 Ключ сохраняется в файл `key.txt` в рабочей директории. При следующем запуске программа предложит использовать сохранённый ключ.
 
+## Сборка в .exe
+
+Для создания автономного исполняемого файла, который можно запустить на любом Windows-компьютере без установки Python:
+
+```bash
+pip install pyinstaller
+python build.py
+```
+
+Результат появится в папке `dist/` — файл `YouTube-File-Storage.exe`.
+
+Собранный .exe включает:
+- Все зависимости Python (OpenCV, NumPy, CustomTkinter)
+- FFmpeg (из imageio-ffmpeg)
+- Ассеты CustomTkinter (шрифты, иконки, темы)
+
+Файл можно скопировать на любой компьютер с Windows и запускать напрямую.
+
 ## Структура проекта
 
 ```
 YouTube-Cloude/
 ├── main.py                          Точка входа (GUI / CLI)
+├── build.py                         Скрипт сборки .exe
 ├── coder.py                         CLI-режим (обратная совместимость)
 ├── requirements.txt                 Зависимости
 ├── core/                            Бизнес-логика
