@@ -5,9 +5,6 @@ import numpy as np
 import os
 import math
 import subprocess
-import tempfile
-import shutil
-import struct
 
 from core.crypto import xor_encrypt
 from utils.ffmpeg_finder import find_ffmpeg
@@ -62,6 +59,8 @@ class YouTubeEncoder:
 
         # Предвычисление маркерного кадра (фон + углы)
         self._marker_frame = self._build_marker_frame()
+        # Предвычисление защитного кадра
+        self._guard_frame = self._build_guard_frame()
 
     # ── предвычисления ─────────────────────────────────────
 
@@ -80,26 +79,40 @@ class YouTubeEncoder:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 2)
         return frame
 
+    def _build_guard_frame(self) -> np.ndarray:
+        """Создаёт защитный кадр (синие блоки)."""
+        frame = self._marker_frame.copy()
+        bw = self.block_width
+        bh = self.block_height
+        sp = self.spacing
+        ms = self.marker_size
+        stride_x = bw + sp
+        stride_y = bh + sp
+        color = np.array([255, 0, 0], dtype=np.uint8)
+
+        for row in range(self.blocks_y * 2):
+            for col in range(self.blocks_x * 2):
+                y1 = ms + row * stride_y
+                x1 = ms + col * stride_x
+                if y1 + bh <= self.height - ms and x1 + bw <= self.width - ms:
+                    frame[y1:y1 + bh, x1:x1 + bw] = color
+        return frame
+
     # ── быстрые утилиты ─────────────────────────────────────
 
     @staticmethod
     def _data_to_blocks(data: bytes) -> np.ndarray:
         """Конвертирует байты в массив 4-битных индексов (0..15). Векторизовано."""
         arr = np.frombuffer(data, dtype=np.uint8)
-        # Каждый байт -> два 4-битных nibble: старший и младший
         high = (arr >> 4) & 0x0F
         low = arr & 0x0F
-        # Чередуем: high[0], low[0], high[1], low[1], ...
         nibbles = np.empty(len(arr) * 2, dtype=np.uint8)
         nibbles[0::2] = high
         nibbles[1::2] = low
         return nibbles
 
     def _render_frame(self, block_indices: np.ndarray) -> np.ndarray:
-        """
-        Рендерит кадр напрямую в numpy-массив без cv2.rectangle.
-        block_indices — массив nibble-индексов (0..15).
-        """
+        """Рендерит кадр напрямую в numpy-массив без cv2.rectangle."""
         frame = self._marker_frame.copy()
 
         bw = self.block_width
@@ -120,20 +133,17 @@ class YouTubeEncoder:
             row = idx // bx
             col = idx % bx
 
-            # ── Основной регион ──────────────────────────
             if row < by:
                 y1 = ms + row * stride_y
                 x1 = ms + col * stride_x
                 frame[y1:y1 + bh, x1:x1 + bw] = color
 
-            # ── Резерв 1 (сдвиг по X) ───────────────────
             rx = col + bx
             if rx < bx * 2 and row < by:
                 y1 = ms + row * stride_y
                 x1 = ms + rx * stride_x
                 frame[y1:y1 + bh, x1:x1 + bw] = color
 
-            # ── Резерв 2 (сдвиг по Y) ───────────────────
             ry = row + by
             if col < bx and ry < by * 2:
                 y1 = ms + ry * stride_y
@@ -142,33 +152,13 @@ class YouTubeEncoder:
 
         return frame
 
-    def _render_guard_frame(self) -> np.ndarray:
-        """Рендерит защитный кадр (синие блоки)."""
-        frame = self._marker_frame.copy()
-        bw = self.block_width
-        bh = self.block_height
-        sp = self.spacing
-        ms = self.marker_size
-        stride_x = bw + sp
-        stride_y = bh + sp
-        color = np.array([255, 0, 0], dtype=np.uint8)
+    def _write_frame_ffmpeg(self, proc: subprocess.Popen, frame: np.ndarray):
+        """Пишет один кадр в stdin FFmpeg."""
+        proc.stdin.write(frame.tobytes())
 
-        for row in range(self.blocks_y * 2):
-            for col in range(self.blocks_x * 2):
-                y1 = ms + row * stride_y
-                x1 = ms + col * stride_x
-                if y1 + bh <= self.height - ms and x1 + bw <= self.width - ms:
-                    frame[y1:y1 + bh, x1:x1 + bw] = color
-
-        return frame
-
-    def _write_opencv_video(self, frames: list[np.ndarray], output_file: str):
-        """Записывает видео через OpenCV из списка numpy-кадров."""
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_file, fourcc, self.fps, (self.width, self.height))
-        for frame in frames:
-            out.write(frame)
-        out.release()
+    def _write_frame_opencv(self, writer: cv2.VideoWriter, frame: np.ndarray):
+        """Пишет один кадр в OpenCV VideoWriter."""
+        writer.write(frame)
 
     # ── основная логика ─────────────────────────────────────
 
@@ -181,6 +171,7 @@ class YouTubeEncoder:
     ) -> bool:
         """
         Кодирует файл в видео.
+        Кадры стримятся напрямую в FFmpeg/OpenCV — не хранятся в памяти.
 
         on_log(str)       — вызывается для каждого текстового сообщения
         on_progress(pct)  — вызывается с процентом прогресса (0..100)
@@ -214,6 +205,9 @@ class YouTubeEncoder:
         eof_nibbles = self._data_to_blocks(self.eof_bytes)
         all_nibbles = np.concatenate([header_nibbles, data_nibbles, eof_nibbles])
 
+        # Освобождаем память исходных данных
+        del data, encrypted_data, header_nibbles, data_nibbles, eof_nibbles
+
         log(f"Всего блоков: {len(all_nibbles)}")
 
         # Кадры
@@ -221,33 +215,15 @@ class YouTubeEncoder:
         data_frames = frames_needed - 5
         log(f"Кадров: {frames_needed} | Длительность: {frames_needed / self.fps:.1f} сек")
 
-        # Рендерим кадры
+        # Определяем способ записи
         ffmpeg_path = find_ffmpeg()
-        all_frames: list[np.ndarray] = []
+        use_ffmpeg = bool(ffmpeg_path)
 
-        for frame_num in range(data_frames):
-            start_idx = frame_num * self.blocks_per_region
-            end_idx = min(start_idx + self.blocks_per_region, len(all_nibbles))
-            frame_nibbles = all_nibbles[start_idx:end_idx]
-            frame = self._render_frame(frame_nibbles)
-            all_frames.append(frame)
+        # Открываем выходной поток
+        proc = None
+        cv_writer = None
 
-            pct = int((frame_num + 1) / frames_needed * 70)
-            if on_progress:
-                on_progress(pct)
-            if frame_num % 50 == 0:
-                log(f"Кадр {frame_num + 1}/{data_frames}")
-
-        # Защитные кадры
-        guard_frame = self._render_guard_frame()
-        for _ in range(5):
-            all_frames.append(guard_frame.copy())
-
-        log("Конвертация в MP4...")
-
-        # Конвертация
-        if ffmpeg_path:
-            # Pipe-режим: пишем кадры напрямую в FFmpeg через stdin
+        if use_ffmpeg:
             cmd = [
                 ffmpeg_path,
                 '-framerate', str(self.fps),
@@ -267,21 +243,57 @@ class YouTubeEncoder:
             try:
                 proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                for frame in all_frames:
-                    proc.stdin.write(frame.tobytes())
+                log("FFmpeg pipe открыт")
+            except Exception as e:
+                log(f"Ошибка FFmpeg: {e}, использую OpenCV...")
+                use_ffmpeg = False
+
+        if not use_ffmpeg:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            cv_writer = cv2.VideoWriter(output_file, fourcc, self.fps, (self.width, self.height))
+            log("OpenCV VideoWriter открыт")
+
+        def write_frame(frame: np.ndarray):
+            if use_ffmpeg and proc:
+                self._write_frame_ffmpeg(proc, frame)
+            elif cv_writer:
+                self._write_frame_opencv(cv_writer, frame)
+
+        # ── Стримим кадры данных ────────────────────────────
+        for frame_num in range(data_frames):
+            start_idx = frame_num * self.blocks_per_region
+            end_idx = min(start_idx + self.blocks_per_region, len(all_nibbles))
+            frame_nibbles = all_nibbles[start_idx:end_idx]
+            frame = self._render_frame(frame_nibbles)
+            write_frame(frame)
+            # Освобождаем память кадра
+            del frame
+
+            pct = int((frame_num + 1) / frames_needed * 70)
+            if on_progress:
+                on_progress(pct)
+            if frame_num % 50 == 0:
+                log(f"Кадр {frame_num + 1}/{data_frames}")
+
+        # ── Защитные кадры ──────────────────────────────────
+        for _ in range(5):
+            write_frame(self._guard_frame)
+
+        # Закрываем выходной поток
+        if proc:
+            try:
                 proc.stdin.close()
-                proc.wait(timeout=120)
+                proc.wait(timeout=300)
                 if proc.returncode == 0:
                     log("FFmpeg конвертация успешна")
                 else:
-                    log("FFmpeg вернул ошибку, использую OpenCV...")
-                    self._write_opencv_video(all_frames, output_file)
+                    log(f"FFmpeg вернул код {proc.returncode}")
             except Exception as e:
-                log(f"Ошибка FFmpeg: {e}, использую OpenCV...")
-                self._write_opencv_video(all_frames, output_file)
-        else:
-            log("FFmpeg не найден, использую OpenCV...")
-            self._write_opencv_video(all_frames, output_file)
+                log(f"Ошибка при закрытии FFmpeg: {e}")
+
+        if cv_writer:
+            cv_writer.release()
+            log("OpenCV VideoWriter закрыт")
 
         if on_progress:
             on_progress(100)
