@@ -51,8 +51,11 @@ args = [
     "--hidden-import=ui.components.log_viewer",
     "--hidden-import=ui.components.console_panel",
 
-    # Иконка приложения (если есть)
-    # "--icon=icon.ico",
+    # Иконка приложения
+    f"--icon=app.ico",
+
+    # Иконка как ресурс (для отображения в окне)
+    f"--add-data=app.ico{os.pathsep}.",
 ]
 
 print("=" * 60)

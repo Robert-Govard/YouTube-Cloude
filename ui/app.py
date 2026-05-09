@@ -1,11 +1,20 @@
 """Главное окно приложения."""
 
+import os
+import sys
 import customtkinter as ctk
 
 from .encode_frame import EncodeFrame
 from .decode_frame import DecodeFrame
 from .components.console_panel import ConsolePanel
 from .theme import COLORS, FONT_TITLE, FONT_TAB, WINDOW_WIDTH, WINDOW_HEIGHT, MIN_WIDTH, MIN_HEIGHT
+
+# Путь к иконке — работает и при обычном запуске, и из .exe
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, 'frozen', False):
+    # PyInstaller: файлы распакованы рядом с exe
+    _PROJECT_ROOT = os.path.dirname(sys.executable)
+_ICON_PATH = os.path.join(_PROJECT_ROOT, 'app.ico')
 
 
 class App(ctk.CTk):
@@ -18,6 +27,10 @@ class App(ctk.CTk):
         self.title('YouTube File Storage')
         self.geometry(f'{WINDOW_WIDTH}x{WINDOW_HEIGHT}')
         self.minsize(MIN_WIDTH, MIN_HEIGHT)
+
+        # Иконка окна
+        if os.path.exists(_ICON_PATH):
+            self.iconbitmap(_ICON_PATH)
 
         # Тёмная тема
         ctk.set_appearance_mode('dark')
