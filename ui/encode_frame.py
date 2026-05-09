@@ -1,7 +1,6 @@
 """Вкладка «Кодировать»."""
 
-import threading
-import queue
+import multiprocessing as mp
 import customtkinter as ctk
 
 from .components.file_picker import FilePicker
@@ -18,6 +17,29 @@ _ERROR = 'error'
 _FINISH = 'finish'
 
 
+def _encode_worker(input_file: str, output_file: str, key: str | None, q: mp.Queue):
+    """Выполняется в отдельном процессе — свой GIL, не блокирует GUI."""
+    try:
+        encoder = YouTubeEncoder(key=key)
+
+        def on_log(msg):
+            q.put((_LOG, msg))
+
+        def on_progress(pct):
+            q.put((_PROGRESS, pct))
+
+        success = encoder.encode(input_file, output_file,
+                                  on_log=on_log, on_progress=on_progress)
+        if success:
+            q.put((_SUCCESS, 'Кодирование завершено успешно!'))
+        else:
+            q.put((_ERROR, 'Ошибка при кодировании'))
+    except Exception as e:
+        q.put((_ERROR, f'Ошибка: {e}'))
+    finally:
+        q.put((_FINISH, None))
+
+
 class EncodeFrame(ctk.CTkFrame):
     """Вкладка кодирования файла в видео."""
 
@@ -25,7 +47,8 @@ class EncodeFrame(ctk.CTkFrame):
         super().__init__(master, fg_color='transparent', **kwargs)
 
         self._running = False
-        self._queue: queue.Queue = queue.Queue()
+        self._queue: mp.Queue | None = None
+        self._process: mp.Process | None = None
         self._poll_id = None
 
         # ── Заголовок ──────────────────────────────────────
@@ -95,42 +118,20 @@ class EncodeFrame(ctk.CTkFrame):
         self._btn_start.configure(state='disabled', text='Кодирование...')
         self._log.clear()
 
-        # Запуск рабочего потока
-        thread = threading.Thread(
-            target=self._run_encode,
-            args=(input_file, output_file, key),
+        # Запуск в отдельном ПРОЦЕССЕ (обходит GIL)
+        self._queue = mp.Queue()
+        self._process = mp.Process(
+            target=_encode_worker,
+            args=(input_file, output_file, key, self._queue),
             daemon=True,
         )
-        thread.start()
+        self._process.start()
 
-        # Запуск поллера (один after на всё время работы)
+        # Запуск поллера
         self._poll()
 
-    def _run_encode(self, input_file: str, output_file: str, key: str | None):
-        """Выполняется в фоновом потоке. Кладёт события в очередь — не трогает tkinter."""
-        q = self._queue
-        encoder = YouTubeEncoder(key=key)
-
-        def on_log(msg):
-            q.put((_LOG, msg))
-
-        def on_progress(pct):
-            q.put((_PROGRESS, pct))
-
-        try:
-            success = encoder.encode(input_file, output_file,
-                                      on_log=on_log, on_progress=on_progress)
-            if success:
-                q.put((_SUCCESS, 'Кодирование завершено успешно!'))
-            else:
-                q.put((_ERROR, 'Ошибка при кодировании'))
-        except Exception as e:
-            q.put((_ERROR, f'Ошибка: {e}'))
-        finally:
-            q.put((_FINISH, None))
-
     def _poll(self):
-        """Забирает ВСЕ накопленные события из очереди за один вызов. Один after на 200мс."""
+        """Забирает события из очереди. Один after на 200мс."""
         q = self._queue
         log = self._log
 
@@ -138,7 +139,7 @@ class EncodeFrame(ctk.CTkFrame):
         while True:
             try:
                 kind, data = q.get_nowait()
-            except queue.Empty:
+            except Exception:
                 break
 
             if kind == _LOG:
@@ -150,9 +151,11 @@ class EncodeFrame(ctk.CTkFrame):
                 log.show_success(data)
             elif kind == _ERROR:
                 log.log(data)
+            elif kind == _FINISH:
+                self._running = False
 
-        # Если работа ещё идёт — планируем следующий опрос
-        if self._running:
+        # Проверяем жив ли процесс
+        if self._process and self._process.is_alive():
             self._poll_id = self.after(200, self._poll)
         else:
             self._on_finish()
@@ -162,4 +165,9 @@ class EncodeFrame(ctk.CTkFrame):
         if self._poll_id is not None:
             self.after_cancel(self._poll_id)
             self._poll_id = None
+        if self._process and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=3)
+        self._process = None
+        self._queue = None
         self._btn_start.configure(state='normal', text='Кодировать')
