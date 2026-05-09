@@ -8,23 +8,24 @@ import re
 from core.crypto import xor_decrypt
 
 # 16 цветов (те же, что в encoder)
+# Палитра устойчива к ±1 искажениям при H.264 сжатии
 COLORS = {
-    '0000': (255, 0, 0),
-    '0001': (0, 255, 0),
-    '0010': (0, 0, 255),
-    '0011': (255, 255, 0),
-    '0100': (255, 0, 255),
-    '0101': (0, 255, 255),
-    '0110': (255, 128, 0),
-    '0111': (128, 0, 255),
-    '1000': (0, 128, 128),
-    '1001': (128, 128, 0),
-    '1010': (128, 0, 128),
-    '1011': (0, 128, 0),
-    '1100': (128, 0, 0),
-    '1101': (0, 0, 128),
-    '1110': (192, 192, 192),
-    '1111': (255, 255, 255),
+    '0000': (48, 48, 48),
+    '0001': (240, 48, 48),
+    '0010': (48, 240, 48),
+    '0011': (240, 240, 48),
+    '0100': (48, 48, 240),
+    '0101': (240, 48, 240),
+    '0110': (48, 240, 240),
+    '0111': (240, 240, 240),
+    '1000': (112, 112, 112),
+    '1001': (176, 112, 112),
+    '1010': (112, 176, 112),
+    '1011': (176, 176, 112),
+    '1100': (112, 112, 176),
+    '1101': (176, 112, 176),
+    '1110': (112, 176, 176),
+    '1111': (176, 176, 176),
 }
 
 EOF_BYTES = b'\xe2\x96\x88' * 64
@@ -33,9 +34,10 @@ HEADER_PATTERN = re.compile(r'FILE:([^:]+):SIZE:(\d+)\|')
 # Предвычисленные таблицы для быстрого декодирования
 _COLOR_VALUES = np.array(list(COLORS.values()), dtype=np.int32)
 _COLOR_KEYS = list(COLORS.keys())
-# Таблица: индекс ближайшего цвета -> 4-битная строка
-# Для быстрого поиска используем квантование: округляем RGB до 64 уровней
-_QUANT_SHIFT = 6  # делим на 64, получаем 4 уровня на канал
+
+# Квантованная LUT: RGB -> nibble-индекс (0..15)
+# Shift=5 даёт 16 уникальных бакетов без коллизий
+_QUANT_SHIFT = 5
 
 
 class YouTubeDecoder:
@@ -50,55 +52,71 @@ class YouTubeDecoder:
         self.key = key
 
         self.colors = COLORS
-        self.color_cache: dict[tuple, str] = {}
 
-        # Расчёт сетки
+        # Расчёт сетки — каждый блок уникален, без дублирования (как в encoder)
         self.blocks_x = (self.width - 2 * self.marker_size) // (self.block_width + self.spacing)
         self.blocks_y = (self.height - 2 * self.marker_size) // (self.block_height + self.spacing)
-        self.blocks_per_region = self.blocks_x * self.blocks_y
+        self.blocks_per_frame = self.blocks_x * self.blocks_y
 
         self._precompute_coordinates()
-
-        # Предвычисление таблицы квантованных цветов
-        self._quant_lut = self._build_quant_lut()
+        self._build_rgb_lut()
 
     # ── предвычисления ─────────────────────────────────────
 
     def _precompute_coordinates(self):
-        """Предвычисляет координаты центров блоков в виде numpy-массивов."""
+        """Предвычисляет координаты центров блоков."""
         ms = self.marker_size
-        bx, by = self.blocks_x, self.blocks_y
-        stride_x = self.block_width + self.spacing
-        stride_y = self.block_height + self.spacing
+        bw = self.block_width
+        bh = self.block_height
+        stride_x = bw + self.spacing
+        stride_y = bh + self.spacing
 
         cx_list = []
         cy_list = []
-        for idx in range(self.blocks_per_region):
-            row = idx // bx
-            col = idx % bx
-            if row < by:
-                cx = ms + col * stride_x + self.block_width // 2
-                cy = ms + row * stride_y + self.block_height // 2
-                cx_list.append(cx)
-                cy_list.append(cy)
+        for row in range(self.blocks_y):
+            for col in range(self.blocks_x):
+                y1 = ms + row * stride_y
+                x1 = ms + col * stride_x
+                cx_list.append(x1 + bw // 2)
+                cy_list.append(y1 + bh // 2)
 
         self._cx_arr = np.array(cx_list, dtype=np.int32)
         self._cy_arr = np.array(cy_list, dtype=np.int32)
         self._n_blocks = len(cx_list)
 
-    def _build_quant_lut(self) -> dict:
-        """Строит lookup-таблицу: квантованный цвет -> 4-битная строка."""
-        lut: dict[tuple, str] = {}
-        for bits, color in self.colors.items():
+    def _build_rgb_lut(self):
+        """Строит LUT: квантованный RGB -> nibble-индекс (0..15).
+
+        Используем квантование с shift=5 (деление на 32),
+        что даёт 16 уникальных бакетов — по одному на каждый цвет.
+        """
+        # Прямая LUT: (r_quant, g_quant, b_quant) -> nibble index
+        quant_lut = {}
+        for i, (bits, color) in enumerate(self.colors.items()):
             q = (color[0] >> _QUANT_SHIFT, color[1] >> _QUANT_SHIFT, color[2] >> _QUANT_SHIFT)
-            if q not in lut:
-                lut[q] = bits
-        return lut
+            if q not in quant_lut:
+                quant_lut[q] = i
+
+        self._quant_lut = quant_lut
+
+        # Также строим полную LUT для быстрого векторизованного декодирования
+        # Квантуем каждый канал до 8 уровней (0..7), комбинируем в ключ
+        # key = r_q * 64 + g_q * 8 + b_q  (8*8*8 = 512 записей)
+        self._flat_lut = np.full(512, 0, dtype=np.uint8)
+        for i, (bits, color) in enumerate(self.colors.items()):
+            rq = color[0] >> _QUANT_SHIFT
+            gq = color[1] >> _QUANT_SHIFT
+            bq = color[2] >> _QUANT_SHIFT
+            key = rq * 64 + gq * 8 + bq
+            self._flat_lut[key] = i
 
     # ── быстрое декодирование ─────────────────────────────
 
-    def _decode_frame_vectorized(self, frame: np.ndarray) -> list[str]:
-        """Векторизованное декодирование одного кадра."""
+    def _decode_frame_vectorized(self, frame: np.ndarray) -> np.ndarray:
+        """Векторизованное декодирование одного кадра.
+
+        Возвращает массив nibble-индексов (0..15) вместо списка строк.
+        """
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             frame = cv2.resize(frame, (self.width, self.height),
                                interpolation=cv2.INTER_NEAREST)
@@ -106,57 +124,31 @@ class YouTubeDecoder:
         # Читаем все пиксели центров блоков одним векторным доступом
         pixels = frame[self._cy_arr, self._cx_arr]  # shape: (n_blocks, 3)
 
-        blocks: list[str] = []
-        cache = self.color_cache
-        quant_lut = self._quant_lut
-        color_values = _COLOR_VALUES
-        color_keys = _COLOR_KEYS
+        # Квантуем и маппим через LUT
+        r_q = (pixels[:, 0].astype(np.int32) >> _QUANT_SHIFT)
+        g_q = (pixels[:, 1].astype(np.int32) >> _QUANT_SHIFT)
+        b_q = (pixels[:, 2].astype(np.int32) >> _QUANT_SHIFT)
 
-        for i in range(self._n_blocks):
-            r, g, b = int(pixels[i, 0]), int(pixels[i, 1]), int(pixels[i, 2])
-            color_key = (r, g, b)
+        keys = r_q * 64 + g_q * 8 + b_q
+        nibble_indices = self._flat_lut[keys]
 
-            # Кэш
-            if color_key in cache:
-                blocks.append(cache[color_key])
-                continue
-
-            # Быстрый поиск через квантование
-            q = (r >> _QUANT_SHIFT, g >> _QUANT_SHIFT, b >> _QUANT_SHIFT)
-            if q in quant_lut:
-                result = quant_lut[q]
-                cache[color_key] = result
-                blocks.append(result)
-                continue
-
-            # Fallback: точный поиск ближайшего
-            color_arr = np.array([r, g, b], dtype=np.int32)
-            distances = np.sum((color_values - color_arr) ** 2, axis=1)
-            best_idx = int(np.argmin(distances))
-            result = color_keys[best_idx]
-            cache[color_key] = result
-            blocks.append(result)
-
-        return blocks
+        return nibble_indices
 
     @staticmethod
-    def _blocks_to_bytes(blocks: list[str]) -> bytearray:
-        """4-битные блоки -> байты. Оптимизировано через numpy."""
-        # Конвертируем 4-битные строки в индексы 0..15
-        nibble_arr = np.array([int(b, 2) for b in blocks], dtype=np.uint8)
-        # Чередуем пары nibble'ов в байты
-        n = len(nibble_arr)
+    def _nibbles_to_bytes(nibble_indices: np.ndarray) -> bytearray:
+        """Массив nibble-индексов (0..15) -> байты. Полностью векторизовано."""
+        n = len(nibble_indices)
         if n % 2 != 0:
-            nibble_arr = np.append(nibble_arr, np.uint8(0))
+            nibble_indices = np.append(nibble_indices, np.uint8(0))
 
-        high = nibble_arr[0::2].astype(np.uint8) << 4
-        low = nibble_arr[1::2]
+        high = nibble_indices[0::2].astype(np.uint8) << 4
+        low = nibble_indices[1::2]
         result = (high | low).astype(np.uint8)
         return bytearray(result.tobytes())
 
     @staticmethod
     def _find_eof(data: bytearray) -> int:
-        """Поиск маркера конца. Использует bytes.find() — C-оптимизированный."""
+        """Поиск маркера конца."""
         return data.find(EOF_BYTES)
 
     # ── основная логика ─────────────────────────────────────
@@ -194,22 +186,24 @@ class YouTubeDecoder:
 
         log(f"Кадров: {total_frames} | FPS: {fps:.1f} | Разрешение: {width}x{height}")
 
-        # Сброс кэша
-        self.color_cache.clear()
+        # Собираем все nibble-индексы напрямую в numpy-массив
+        # Предварительно оцениваем размер
+        estimated_nibbles = total_frames * self._n_blocks
+        all_nibbles = np.empty(estimated_nibbles, dtype=np.uint8)
+        nibble_count = 0
 
-        all_blocks: list[str] = []
-        frames_processed = 0
         last_progress_pct = -1
 
         for frame_num in range(total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
-            frames_processed += 1
 
-            all_blocks.extend(self._decode_frame_vectorized(frame))
+            frame_nibbles = self._decode_frame_vectorized(frame)
+            n = len(frame_nibbles)
+            all_nibbles[nibble_count:nibble_count + n] = frame_nibbles
+            nibble_count += n
 
-            # Обновляем прогресс не чаще чем раз в 1%
             pct = int((frame_num + 1) / total_frames * 80)
             if pct != last_progress_pct:
                 last_progress_pct = pct
@@ -220,10 +214,12 @@ class YouTubeDecoder:
 
         cap.release()
 
-        log(f"Обработано кадров: {frames_processed}, блоков: {len(all_blocks)}")
+        all_nibbles = all_nibbles[:nibble_count]
+        log(f"Обработано блоков: {nibble_count}")
 
-        # Конвертация
-        bytes_data = self._blocks_to_bytes(all_blocks)
+        # Конвертация nibbles -> байты (векторизовано)
+        bytes_data = self._nibbles_to_bytes(all_nibbles)
+        del all_nibbles
         log(f"Получено байт: {len(bytes_data)}")
 
         # Маркер конца

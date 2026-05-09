@@ -10,23 +10,25 @@ from core.crypto import xor_encrypt
 from utils.ffmpeg_finder import find_ffmpeg
 
 # 16 цветов: 4-битный код -> RGB
+# Палитра устойчива к ±1 искажениям при H.264 сжатии (shift=5 квантование)
+# Все значения (48, 112, 176, 240) находятся в центрах квантованных бакетов
 COLORS = {
-    '0000': (255, 0, 0),
-    '0001': (0, 255, 0),
-    '0010': (0, 0, 255),
-    '0011': (255, 255, 0),
-    '0100': (255, 0, 255),
-    '0101': (0, 255, 255),
-    '0110': (255, 128, 0),
-    '0111': (128, 0, 255),
-    '1000': (0, 128, 128),
-    '1001': (128, 128, 0),
-    '1010': (128, 0, 128),
-    '1011': (0, 128, 0),
-    '1100': (128, 0, 0),
-    '1101': (0, 0, 128),
-    '1110': (192, 192, 192),
-    '1111': (255, 255, 255),
+    '0000': (48, 48, 48),
+    '0001': (240, 48, 48),
+    '0010': (48, 240, 48),
+    '0011': (240, 240, 48),
+    '0100': (48, 48, 240),
+    '0101': (240, 48, 240),
+    '0110': (48, 240, 240),
+    '0111': (240, 240, 240),
+    '1000': (112, 112, 112),
+    '1001': (176, 112, 112),
+    '1010': (112, 176, 112),
+    '1011': (176, 176, 112),
+    '1100': (112, 112, 176),
+    '1101': (176, 112, 176),
+    '1110': (112, 176, 176),
+    '1111': (176, 176, 176),
 }
 
 EOF_MARKER = "\u2588" * 64  # "█" * 64
@@ -52,15 +54,17 @@ class YouTubeEncoder:
         self.colors = COLORS
         self.eof_bytes = EOF_MARKER.encode('utf-8')
 
-        # Расчёт сетки
+        # Расчёт сетки — каждый блок уникален, без дублирования
         self.blocks_x = (self.width - 2 * self.marker_size) // (self.block_width + self.spacing)
         self.blocks_y = (self.height - 2 * self.marker_size) // (self.block_height + self.spacing)
-        self.blocks_per_region = self.blocks_x * self.blocks_y
+        self.blocks_per_frame = self.blocks_x * self.blocks_y
 
         # Предвычисление маркерного кадра (фон + углы)
         self._marker_frame = self._build_marker_frame()
         # Предвычисление защитного кадра
         self._guard_frame = self._build_guard_frame()
+        # Предвычисление координат блоков
+        self._precompute_block_coords()
 
     # ── предвычисления ─────────────────────────────────────
 
@@ -88,15 +92,40 @@ class YouTubeEncoder:
         ms = self.marker_size
         stride_x = bw + sp
         stride_y = bh + sp
-        color = np.array([255, 0, 0], dtype=np.uint8)
+        color = np.array([48, 240, 48], dtype=np.uint8)  # цвет 0010
 
-        for row in range(self.blocks_y * 2):
-            for col in range(self.blocks_x * 2):
+        for row in range(self.blocks_y):
+            for col in range(self.blocks_x):
                 y1 = ms + row * stride_y
                 x1 = ms + col * stride_x
-                if y1 + bh <= self.height - ms and x1 + bw <= self.width - ms:
-                    frame[y1:y1 + bh, x1:x1 + bw] = color
+                frame[y1:y1 + bh, x1:x1 + bw] = color
         return frame
+
+    def _precompute_block_coords(self):
+        """Предвычисляет координаты всех блоков для быстрого рендеринга.
+
+        Каждый блок имеет ровно одну позицию в сетке.
+        Координаты хранятся как Python-списки для максимальной скорости
+        в горячем цикле рендеринга.
+        """
+        bw = self.block_width
+        bh = self.block_height
+        ms = self.marker_size
+        stride_x = bw + self.spacing
+        stride_y = bh + self.spacing
+
+        y1_list = []
+        x1_list = []
+        for row in range(self.blocks_y):
+            for col in range(self.blocks_x):
+                y1 = ms + row * stride_y
+                x1 = ms + col * stride_x
+                y1_list.append(y1)
+                x1_list.append(x1)
+
+        self._block_y1 = y1_list
+        self._block_x1 = x1_list
+        self._actual_blocks = len(y1_list)
 
     # ── быстрые утилиты ─────────────────────────────────────
 
@@ -112,49 +141,26 @@ class YouTubeEncoder:
         return nibbles
 
     def _render_frame(self, block_indices: np.ndarray) -> np.ndarray:
-        """Рендерит кадр напрямую в numpy-массив без cv2.rectangle."""
+        """Рендерит кадр — каждый блок в своей уникальной позиции."""
         frame = self._marker_frame.copy()
 
-        bw = self.block_width
         bh = self.block_height
-        sp = self.spacing
-        ms = self.marker_size
-        stride_x = bw + sp
-        stride_y = bh + sp
-        bx = self.blocks_x
-        by = self.blocks_y
+        bw = self.block_width
+        n = min(len(block_indices), self._actual_blocks)
 
-        n = len(block_indices)
+        # Получаем цвета для всех nibble-индексов
+        colors = _COLOR_TABLE[block_indices[:n]]
 
-        for idx in range(n):
-            nibble = block_indices[idx]
-            color = _COLOR_TABLE[nibble]
-
-            row = idx // bx
-            col = idx % bx
-
-            if row < by:
-                y1 = ms + row * stride_y
-                x1 = ms + col * stride_x
-                frame[y1:y1 + bh, x1:x1 + bw] = color
-
-            rx = col + bx
-            if rx < bx * 2 and row < by:
-                y1 = ms + row * stride_y
-                x1 = ms + rx * stride_x
-                frame[y1:y1 + bh, x1:x1 + bw] = color
-
-            ry = row + by
-            if col < bx and ry < by * 2:
-                y1 = ms + ry * stride_y
-                x1 = ms + col * stride_x
-                frame[y1:y1 + bh, x1:x1 + bw] = color
+        # Python-цикл — самый быстрый вариант для slice-присваивания блоков
+        for i in range(n):
+            frame[self._block_y1[i]:self._block_y1[i] + bh,
+                  self._block_x1[i]:self._block_x1[i] + bw] = colors[i]
 
         return frame
 
     def _write_frame_ffmpeg(self, proc: subprocess.Popen, frame: np.ndarray):
         """Пишет один кадр в stdin FFmpeg."""
-        proc.stdin.write(frame.tobytes())
+        proc.stdin.write(frame.data.tobytes())
 
     def _write_frame_opencv(self, writer: cv2.VideoWriter, frame: np.ndarray):
         """Пишет один кадр в OpenCV VideoWriter."""
@@ -210,10 +216,12 @@ class YouTubeEncoder:
 
         log(f"Всего блоков: {len(all_nibbles)}")
 
-        # Кадры
-        frames_needed = math.ceil(len(all_nibbles) / self.blocks_per_region) + 5
+        # Кадры — используем полную сетку без дублирования
+        bpf = self._actual_blocks
+        frames_needed = math.ceil(len(all_nibbles) / bpf) + 5
         data_frames = frames_needed - 5
         log(f"Кадров: {frames_needed} | Длительность: {frames_needed / self.fps:.1f} сек")
+        log(f"Блоков на кадр: {bpf} ({bpf // 2} байт/кадр)")
 
         # Определяем способ записи
         ffmpeg_path = find_ffmpeg()
@@ -233,8 +241,8 @@ class YouTubeEncoder:
                 '-i', '-',
                 '-c:v', 'libx264',
                 '-preset', 'fast',
-                '-crf', '23',
-                '-pix_fmt', 'yuv420p',
+                '-crf', '0',
+                '-pix_fmt', 'yuv444p',
                 '-an',
                 '-movflags', '+faststart',
                 '-y',
@@ -261,12 +269,11 @@ class YouTubeEncoder:
 
         # ── Стримим кадры данных ────────────────────────────
         for frame_num in range(data_frames):
-            start_idx = frame_num * self.blocks_per_region
-            end_idx = min(start_idx + self.blocks_per_region, len(all_nibbles))
+            start_idx = frame_num * bpf
+            end_idx = min(start_idx + bpf, len(all_nibbles))
             frame_nibbles = all_nibbles[start_idx:end_idx]
             frame = self._render_frame(frame_nibbles)
             write_frame(frame)
-            # Освобождаем память кадра
             del frame
 
             pct = int((frame_num + 1) / frames_needed * 70)
