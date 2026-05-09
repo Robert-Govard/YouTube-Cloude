@@ -7,6 +7,19 @@ import customtkinter as ctk
 from ..theme import COLORS, FONT_LOG
 
 
+class _NullStream:
+    """Поток-заглушка для случаев, когда stdout/stderr = None (PyInstaller --windowed)."""
+
+    def write(self, text):
+        pass
+
+    def flush(self):
+        pass
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
 class ConsolePanel(ctk.CTkFrame):
     """
     Панель консоли внутри приложения.
@@ -60,8 +73,9 @@ class ConsolePanel(ctk.CTkFrame):
         self._textbox.configure(state='disabled')
 
         # ── Перехват stdout/stderr ──────────────────────────
-        self._original_stdout = sys.stdout
-        self._original_stderr = sys.stderr
+        # При PyInstaller --windowed потоки могут быть None
+        self._original_stdout = sys.stdout if sys.stdout else _NullStream()
+        self._original_stderr = sys.stderr if sys.stderr else _NullStream()
         self._lock = threading.Lock()
 
         sys.stdout = _StreamInterceptor(self, 'out')
@@ -70,30 +84,29 @@ class ConsolePanel(ctk.CTkFrame):
     def write(self, text: str, source: str = 'out'):
         """Записывает текст в консоль GUI + оригинальный поток."""
         with self._lock:
-            # Оригинальный поток (реальный терминал)
-            if source == 'err':
-                self._original_stderr.write(text)
-                self._original_stderr.flush()
-            else:
-                self._original_stdout.write(text)
-                self._original_stdout.flush()
+            # Оригинальный поток (реальный терминал), безопасно если None
+            try:
+                if source == 'err':
+                    self._original_stderr.write(text)
+                    self._original_stderr.flush()
+                else:
+                    self._original_stdout.write(text)
+                    self._original_stdout.flush()
+            except (AttributeError, ValueError):
+                pass
 
             # GUI — только если есть непустой текст
             if text and text.strip():
-                # Добавляем префикс для stderr
-                display = text if source == 'out' else text
-                self._append(display)
+                self._append(text)
 
     def _append(self, text: str):
         """Потокобезопасная вставка текста в виджет."""
-        # Используем after(), если вызов из другого потока
         try:
             self._textbox.configure(state='normal')
             self._textbox.insert('end', text)
             self._textbox.see('end')
             self._textbox.configure(state='disabled')
         except Exception:
-            # Если вызов из рабочего потока — через after
             self.after(0, lambda: self._insert_safe(text))
 
     def _insert_safe(self, text: str):
@@ -114,8 +127,10 @@ class ConsolePanel(ctk.CTkFrame):
 
     def restore_streams(self):
         """Восстанавливает оригинальные stdout/stderr."""
-        sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
+        if isinstance(sys.stdout, _StreamInterceptor):
+            sys.stdout = self._original_stdout
+        if isinstance(sys.stderr, _StreamInterceptor):
+            sys.stderr = self._original_stderr
 
     def destroy(self):
         self.restore_streams()
@@ -133,9 +148,16 @@ class _StreamInterceptor:
         self._panel.write(text, self._source)
 
     def flush(self):
-        pass
+        try:
+            original = self._panel._original_stdout if self._source == 'out' else self._panel._original_stderr
+            original.flush()
+        except (AttributeError, ValueError):
+            pass
 
     def __getattr__(self, name):
         # Проксируем остальные атрибуты к оригинальному потоку
         original = self._panel._original_stdout if self._source == 'out' else self._panel._original_stderr
-        return getattr(original, name)
+        try:
+            return getattr(original, name)
+        except AttributeError:
+            return lambda *a, **kw: None
