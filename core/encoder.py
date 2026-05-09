@@ -5,8 +5,6 @@ import numpy as np
 import os
 import math
 import subprocess
-import zipfile
-import io
 
 from core.crypto import xor_encrypt
 from utils.ffmpeg_finder import find_ffmpeg
@@ -35,22 +33,6 @@ EOF_MARKER = "\u2588" * 64  # "█" * 64
 
 # Предвычисленная таблица: индекс 0..15 -> RGB
 _COLOR_TABLE = np.array([COLORS[f'{i:04b}'] for i in range(16)], dtype=np.uint8)
-
-
-def _zip_compress(input_file: str) -> tuple[bytes, str, int]:
-    """
-    Сжимает файл в ZIP-архив в памяти.
-    Возвращает (zip_data, original_filename, original_size).
-    """
-    original_name = os.path.basename(input_file)
-    original_size = os.path.getsize(input_file)
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        zf.write(input_file, original_name)
-    zip_data = buf.getvalue()
-
-    return zip_data, original_name, original_size
 
 
 class YouTubeEncoder:
@@ -189,7 +171,6 @@ class YouTubeEncoder:
     ) -> bool:
         """
         Кодирует файл в видео.
-        Сначала сжимает файл в ZIP, затем кодирует ZIP в видео.
         Кадры стримятся напрямую в FFmpeg/OpenCV — не хранятся в памяти.
 
         on_log(str)       — вызывается для каждого текстового сообщения
@@ -199,26 +180,22 @@ class YouTubeEncoder:
             if on_log:
                 on_log(msg)
 
-        # ── Сжатие в ZIP ────────────────────────────────────
-        log(f"Сжатие в ZIP: {input_file}")
-        zip_data, original_name, original_size = _zip_compress(input_file)
+        # Читаем файл
+        with open(input_file, 'rb') as f:
+            data = f.read()
 
-        zip_name = original_name + '.zip'
-        zip_size = len(zip_data)
-        ratio = (1 - zip_size / original_size) * 100 if original_size > 0 else 0
-        log(f"Оригинал: {original_size} байт | ZIP: {zip_size} байт | Сжатие: {ratio:.1f}%")
+        log(f"Файл: {input_file}")
+        log(f"Размер: {len(data)} байт")
 
-        # Шифрование ZIP-данных
+        # Шифрование
         if self.use_encryption:
-            encrypted_data = xor_encrypt(zip_data, self.key)
+            encrypted_data = xor_encrypt(data, self.key)
             log("Данные зашифрованы")
         else:
-            encrypted_data = zip_data
+            encrypted_data = data
 
-        del zip_data
-
-        # Заголовок: хранит имя ZIP-файла и размер зашифрованных данных
-        header = f"FILE:{zip_name}:SIZE:{len(encrypted_data)}:ORIG:{original_name}:ORIGSIZE:{original_size}|"
+        # Заголовок
+        header = f"FILE:{os.path.basename(input_file)}:SIZE:{len(data)}|"
         header_bytes = header.encode('latin-1')
         log(f"Заголовок: {header}")
 
@@ -228,8 +205,8 @@ class YouTubeEncoder:
         eof_nibbles = self._data_to_blocks(self.eof_bytes)
         all_nibbles = np.concatenate([header_nibbles, data_nibbles, eof_nibbles])
 
-        # Освобождаем память
-        del encrypted_data, header_nibbles, data_nibbles, eof_nibbles
+        # Освобождаем память исходных данных
+        del data, encrypted_data, header_nibbles, data_nibbles, eof_nibbles
 
         log(f"Всего блоков: {len(all_nibbles)}")
 
@@ -289,6 +266,7 @@ class YouTubeEncoder:
             frame_nibbles = all_nibbles[start_idx:end_idx]
             frame = self._render_frame(frame_nibbles)
             write_frame(frame)
+            # Освобождаем память кадра
             del frame
 
             pct = int((frame_num + 1) / frames_needed * 70)
