@@ -1,6 +1,7 @@
 """Вкладка «Декодировать»."""
 
 import threading
+import queue
 import customtkinter as ctk
 
 from .components.file_picker import FilePicker
@@ -10,6 +11,12 @@ from .theme import COLORS, FONT_TAB, FONT_BUTTON
 from core.decoder import YouTubeDecoder
 from utils.key_storage import save_key
 
+_LOG = 'log'
+_PROGRESS = 'progress'
+_SUCCESS = 'success'
+_ERROR = 'error'
+_FINISH = 'finish'
+
 
 class DecodeFrame(ctk.CTkFrame):
     """Вкладка декодирования видео в файл."""
@@ -18,6 +25,8 @@ class DecodeFrame(ctk.CTkFrame):
         super().__init__(master, fg_color='transparent', **kwargs)
 
         self._running = False
+        self._queue: queue.Queue = queue.Queue()
+        self._poll_id = None
 
         # ── Заголовок ──────────────────────────────────────
         header = ctk.CTkLabel(
@@ -78,7 +87,6 @@ class DecodeFrame(ctk.CTkFrame):
         output_dir = self._output_picker.get() or '.'
         key = self._key_input.get()
 
-        # Сохраняем ключ, если введён
         if key:
             save_key(key)
 
@@ -86,6 +94,7 @@ class DecodeFrame(ctk.CTkFrame):
         self._btn_start.configure(state='disabled', text='Декодирование...')
         self._log.clear()
 
+        # Запуск рабочего потока
         thread = threading.Thread(
             target=self._run_decode,
             args=(input_file, output_dir, key),
@@ -93,28 +102,61 @@ class DecodeFrame(ctk.CTkFrame):
         )
         thread.start()
 
+        # Запуск поллера
+        self._poll()
+
     def _run_decode(self, input_file: str, output_dir: str, key: str | None):
+        """Выполняется в фоновом потоке. Кладёт события в очередь — не трогает tkinter."""
+        q = self._queue
         decoder = YouTubeDecoder(key=key)
 
         def on_log(msg):
-            self.after(0, lambda: self._log.log(msg))
+            q.put((_LOG, msg))
 
         def on_progress(pct):
-            self.after(0, lambda: self._log.set_progress(pct))
+            q.put((_PROGRESS, pct))
 
         try:
             success = decoder.decode(input_file, output_dir,
                                       on_log=on_log, on_progress=on_progress)
             if success:
-                self.after(0, lambda: self._log.log('Декодирование завершено успешно!'))
-                self.after(0, lambda: self._log.show_success('Декодирование завершено успешно!'))
+                q.put((_SUCCESS, 'Декодирование завершено успешно!'))
             else:
-                self.after(0, lambda: self._log.log('Ошибка при декодировании'))
+                q.put((_ERROR, 'Ошибка при декодировании'))
         except Exception as e:
-            self.after(0, lambda: self._log.log(f'Ошибка: {e}'))
+            q.put((_ERROR, f'Ошибка: {e}'))
         finally:
-            self.after(0, self._on_finish)
+            q.put((_FINISH, None))
+
+    def _poll(self):
+        """Забирает ВСЕ накопленные события из очереди за один вызов. Один after на 200мс."""
+        q = self._queue
+        log = self._log
+
+        while True:
+            try:
+                kind, data = q.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == _LOG:
+                log.log(data)
+            elif kind == _PROGRESS:
+                log.set_progress(data)
+            elif kind == _SUCCESS:
+                log.log(data)
+                log.show_success(data)
+            elif kind == _ERROR:
+                log.log(data)
+
+        if self._running:
+            self._poll_id = self.after(200, self._poll)
+        else:
+            self._on_finish()
 
     def _on_finish(self):
         self._running = False
+        if self._poll_id is not None:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
         self._btn_start.configure(state='normal', text='Декодировать')
